@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Artificial Life — CRT</title>
+<style>
+  *{margin:0;padding:0}
+  html,body{width:100%;height:100%;overflow:hidden;background:#000}
+  canvas{display:block;width:100%;height:100%}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* ─── bootstrap ─── */
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: false, alpha: false });
+if (!gl) throw new Error('WebGL not available');
+
+let W, H;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio, 2);
+  W = Math.floor(window.innerWidth  * dpr);
+  H = Math.floor(window.innerHeight * dpr);
+  canvas.width  = W;
+  canvas.height = H;
+  init();
+}
+
+/* ─── helpers ─── */
+function compileShader(src, type) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function createProgram(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compileShader(vs, gl.VERTEX_SHADER));
+  gl.attachShader(p, compileShader(fs, gl.FRAGMENT_SHADER));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(p));
+  return p;
+}
+
+/* ─── shaders ─── */
+const quadVS = `
+attribute vec2 a_pos;
+varying vec2 v_uv;
+void main(){
+  v_uv = a_pos * 0.5 + 0.5;
+  gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+/* ping-pong simulation shader */
+const simFS = `
+precision highp float;
+varying vec2 v_uv;
+uniform sampler2D u_prev;
+uniform vec2   u_res;
+uniform float  u_seed;
+
+void main(){
+  vec2 p = v_uv;
+  vec2 n = 1.0 / u_res;
+
+  float alive = texture2D(u_prev, p).r;
+  int neighbours = 0;
+  for(int dy = -1; dy <= 1; dy++)
+    for(int dx = -1; dx <= 1; dx++){
+      if(dx==0 && dy==0) continue;
+      vec2 nb = p + vec2(float(dx), float(dy)) * n;
+      nb = mod(nb + 0.5, 1.0);
+      neighbours += int(texture2D(u_prev, nb).r * 2.0);
+    }
+
+  bool born     = (neighbours == 3);
+  bool survives = (neighbours == 2) && (alive > 0.5);
+  float next = (born || survives) ? 1.0 : 0.0;
+
+  gl_FragColor = vec4(vec3(next), 1.0);
+}`;
+
+/* CRT post-processing shader */
+const crtFS = `
+precision highp float;
+varying vec2 v_uv;
+uniform sampler2D u_sim;
+uniform vec2   u_res;
+uniform float  u_time;
+
+/* hash noise */
+float hash(vec2 p){
+  return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453);
+}
+float noise(vec2 p){
+  vec2 i = floor(p);
+  vec2 f = fract(p);
+  f = f*f*(3.0 - 2.0*f);
+  float a = hash(i);
+  float b = hash(i + vec2(1,0));
+  float c = hash(i + vec2(0,1));
+  float d = hash(i + vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+}
+
+void main(){
+  vec2 uv = v_uv;
+
+  /* ── barrel distortion ── */
+  vec2 dc = uv - 0.5;
+  float d2 = dot(dc, dc);
+  float k  = 0.25;
+  uv = 0.5 + dc * (1.0 + d2 * k);
+
+  if(uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0){
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+
+  /* ── sample sim texture ── */
+  vec3 col = texture2D(u_sim, uv).rgb;
+
+  /* ── phosphor color mapping ── */
+  float age = texture2D(u_sim, uv + vec2(0.001, 0.0)).r - col.r;
+  vec3 phosphor;
+  if(col.r > 0.5){
+    float t = fract(uv.x * 200.0 + uv.y * 200.0 + u_time * 0.3);
+    phosphor = mix(vec3(0.0, 1.0, 0.3), vec3(0.1, 0.95, 0.6), smoothstep(0.4, 0.6, t));
+  } else {
+    phosphor = vec3(0.01, 0.01, 0.02);
+  }
+  col = phosphor;
+
+  /* ── glow / bloom ── */
+  vec2 gn = 1.0 / u_res;
+  float glow = 0.0;
+  for(int i = -2; i <= 2; i++)
+    for(int j = -2; j <= 2; j++){
+      vec2 o = vec2(float(i), float(j)) * gn * 1.5;
+      glow += texture2D(u_sim, uv + o).r;
+    }
+  glow /= 25.0;
+  col += phosphor * glow * 0.6;
+
+  /* ── scanlines ── */
+  float scanline = sin(uv.y * u_res.y * 3.14159) * 0.5 + 0.5;
+  scanline = pow(scanline, 0.4);
+  col *= 0.65 + 0.35 * scanline;
+
+  /* ── fine horizontal line ── */
+  float hline = sin(uv.y * u_res.y * 6.28318 * 0.5) * 0.5 + 0.5;
+  col *= 0.92 + 0.08 * hline;
+
+  /* ── TV static noise ── */
+  float staticNoise = noise(uv * u_res * 2.0 + u_time * 17.0) * 0.08;
+  col += staticNoise;
+
+  /* ── rolling bar ── */
+  float roll = sin(uv.y * 3.0 - u_time * 0.5) * 0.5 + 0.5;
+  roll = smoothstep(0.45, 0.55, roll);
+  col += roll * 0.03;
+
+  /* ── chromatic aberration ── */
+  float ca = 0.002;
+  float r = texture2D(u_sim, uv + vec2(ca, 0.0)).r;
+  float b = texture2D(u_sim, uv - vec2(ca, 0.0)).r;
+  col.r = mix(col.r, r * 0.8, 0.3);
+  col.b = mix(col.b, b * 0.9, 0.3);
+
+  /* ── vignette ── */
+  float vig = 1.0 - d2 * 1.2;
+  vig = clamp(vig, 0.0, 1.0);
+  col *= vig;
+
+  /* ── flicker ── */
+  float flicker = 0.97 + 0.03 * sin(u_time * 60.0) * noise(vec2(u_time, 0.0));
+  col *= flicker;
+
+  /* ── phosphor persistence trail ── */
+  col = pow(col, vec3(0.9));
+
+  /* ── gamma ── */
+  col = pow(col, vec3(1.0 / 2.2));
+
+  /* ── clamp ── */
+  col = clamp(col, 0.0, 1.0);
+
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+/* ─── state ─── */
+let simProgram, crtProgram;
+let fboA, fboB, curFBO = 0;
+let quadBuf;
+
+function init() {
+  /* programs */
+  simProgram = createProgram(quadVS, simFS);
+  crtProgram = createProgram(quadVS, crtFS);
+
+  /* quad */
+  quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+  /* framebuffer pair */
+  [fboA, fboB].forEach(fbo => {
+    if (fbo && fbo.tex) gl.deleteTexture(fbo.tex);
+  });
+  function makeFBO() {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return { fb, tex };
+  }
+  fboA = makeFBO();
+  fboB = makeFBO();
+  curFBO = 0;
+
+  /* seed initial state */
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fboA.fb);
+  gl.useProgram(simProgram);
+  const seedLoc = gl.getUniformLocation(simProgram, 'u_seed');
+  const resLoc  = gl.getUniformLocation(simProgram, 'u_res');
+  const prevLoc = gl.getUniformLocation(simProgram, 'u_prev');
+  gl.uniform1f(seedLoc, 1.0);
+  gl.uniform2f(resLoc, W, H);
+  gl.uniform1i(prevLoc, 0);
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, fboA.tex);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  const aPos = gl.getAttribLocation(simProgram, 'a_pos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+/* ─── render loop ─── */
+let t0 = performance.now();
+
+function frame() {
+  const t = (performance.now() - t0) / 1000;
+
+  /* ── simulation step ── */
+  const src = curFBO === 0 ? fboA : fboB;
+  const dst = curFBO === 0 ? fboB : fboA;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb);
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(simProgram);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, src.tex);
+  gl.uniform1i(gl.getUniformLocation(simProgram, 'u_prev'), 0);
+  gl.uniform2f(gl.getUniformLocation(simProgram, 'u_res'), W, H);
+  gl.uniform1f(gl.getUniformLocation(simProgram, 'u_seed'), 0.0);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  const aPos = gl.getAttribLocation(simProgram, 'a_pos');
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  curFBO = 1 - curFBO;
+
+  /* ── CRT display ── */
+  const simTex = curFBO === 0 ? fboA.tex : fboB.tex;
+
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, W, H);
+  gl.useProgram(crtProgram);
+
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D, simTex);
+  gl.uniform1i(gl.getUniformLocation(crtProgram, 'u_sim'), 0);
+  gl.uniform2f(gl.getUniformLocation(crtProgram, 'u_res'), W, H);
+  gl.uniform1f(gl.getUniformLocation(crtProgram, 'u_time'), t);
+
+  const aPos2 = gl.getAttribLocation(crtProgram, 'a_pos');
+  gl.enableVertexAttribArray(aPos2);
+  gl.vertexAttribPointer(aPos2, 2, gl.FLOAT, false, 0, 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  requestAnimationFrame(frame);
+}
+
+window.addEventListener('resize', resize);
+resize();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

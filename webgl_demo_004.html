@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Artificial Life - CRT</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { overflow: hidden; background: #000; }
+        canvas { display: block; width: 100vw; height: 100vh; }
+    </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<script>
+const canvas = document.getElementById('canvas');
+const gl = canvas.getContext('webgl2') || canvas.getContext('webgl');
+
+const SIM_WIDTH = 512;
+const SIM_HEIGHT = 512;
+
+const quadVert = `#version 300 es
+in vec2 a_pos;
+out vec2 v_uv;
+void main() {
+    v_uv = a_pos * 0.5 + 0.5;
+    gl_Position = vec4(a_pos, 0.0, 1.0);
+}`;
+
+const lifeFrag = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 fragColor;
+uniform sampler2D u_state;
+uniform vec2 u_resolution;
+
+void main() {
+    vec2 pixel = 1.0 / u_resolution;
+    float sum = 0.0;
+
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            if (x == 0 && y == 0) continue;
+            vec2 offset = vec2(float(x), float(y)) * pixel;
+            sum += texture(u_state, v_uv + offset).r;
+        }
+    }
+
+    float current = texture(u_state, v_uv).r;
+    float next = 0.0;
+
+    if (current > 0.5) {
+        next = (sum >= 2.0 && sum <= 3.0) ? 1.0 : 0.0;
+    } else {
+        next = (sum >= 2.5 && sum <= 3.5) ? 1.0 : 0.0;
+    }
+
+    fragColor = vec4(next, next, next, 1.0);
+}`;
+
+const crtFrag = `#version 300 es
+precision highp float;
+in vec2 v_uv;
+out vec4 fragColor;
+uniform sampler2D u_state;
+uniform float u_time;
+uniform vec2 u_resolution;
+
+float rand(vec2 co) {
+    return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
+}
+
+void main() {
+    vec2 uv = v_uv;
+
+    vec2 crtUV = uv - 0.5;
+    float dist = length(crtUV);
+    crtUV *= 1.0 + dist * dist * 0.1;
+    crtUV += 0.5;
+
+    if (crtUV.x < 0.0 || crtUV.x > 1.0 || crtUV.y < 0.0 || crtUV.y > 1.0) {
+        fragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        return;
+    }
+
+    float life = texture(u_state, crtUV).r;
+
+    vec3 color = life > 0.5
+        ? vec3(0.2, 1.0, 0.3)
+        : vec3(0.02, 0.05, 0.03);
+
+    float scanline = sin(crtUV.y * u_resolution.y * 2.0) * 0.04;
+    color -= scanline;
+
+    float noise = rand(crtUV + u_time) * 0.08;
+    color += noise - 0.04;
+
+    float flicker = 1.0 + sin(u_time * 8.0) * 0.01;
+    color *= flicker;
+
+    float rgbOffset = 0.002;
+    float r = texture(u_state, crtUV + vec2(rgbOffset, 0.0)).r;
+    float b = texture(u_state, crtUV - vec2(rgbOffset, 0.0)).r;
+
+    if (life > 0.5) {
+        color.r = mix(color.r, r > 0.5 ? 0.3 : 0.1, 0.5);
+        color.b = mix(color.b, b > 0.5 ? 0.4 : 0.1, 0.3);
+    }
+
+    float vignette = 1.0 - dist * 0.8;
+    color *= vignette;
+
+    float rollLine = mod(u_time * 0.5, 2.0) - 0.5;
+    if (abs(uv.y - rollLine) < 0.005) {
+        color += 0.1;
+    }
+
+    color = pow(color, vec3(0.9));
+
+    fragColor = vec4(color, 1.0);
+}`;
+
+function createShader(gl, type, source) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error(gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+    }
+    return shader;
+}
+
+function createProgram(gl, vertSrc, fragSrc) {
+    const vert = createShader(gl, gl.VERTEX_SHADER, vertSrc);
+    const frag = createShader(gl, gl.FRAGMENT_SHADER, fragSrc);
+    const program = gl.createProgram();
+    gl.attachShader(program, vert);
+    gl.attachShader(program, frag);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error(gl.getProgramInfoLog(program));
+        return null;
+    }
+    return program;
+}
+
+function createTexture(gl, width, height, data) {
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.REPEAT);
+    return tex;
+}
+
+function createFramebuffer(gl, texture) {
+    const fb = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, texture, 0);
+    return fb;
+}
+
+const lifeProgram = createProgram(gl, quadVert, lifeFrag);
+const crtProgram = createProgram(gl, quadVert, crtFrag);
+
+const quadBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+
+const initialData = new Uint8Array(SIM_WIDTH * SIM_HEIGHT * 4);
+for (let i = 0; i < SIM_WIDTH * SIM_HEIGHT; i++) {
+    const alive = Math.random() < 0.3 ? 255 : 0;
+    initialData[i * 4] = alive;
+    initialData[i * 4 + 1] = alive;
+    initialData[i * 4 + 2] = alive;
+    initialData[i * 4 + 3] = 255;
+}
+
+let texA = createTexture(gl, SIM_WIDTH, SIM_HEIGHT, initialData);
+let texB = createTexture(gl, SIM_WIDTH, SIM_HEIGHT, null);
+let fbA = createFramebuffer(gl, texA);
+let fbB = createFramebuffer(gl, texB);
+
+let currentTex = texA;
+let currentFB = fbB;
+
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+
+let lastTime = 0;
+let simAccum = 0;
+const SIM_INTERVAL = 1000 / 15;
+
+function render(time) {
+    const dt = time - lastTime;
+    lastTime = time;
+    simAccum += dt;
+
+    while (simAccum >= SIM_INTERVAL) {
+        simAccum -= SIM_INTERVAL;
+
+        gl.viewport(0, 0, SIM_WIDTH, SIM_HEIGHT);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, currentFB);
+        gl.useProgram(lifeProgram);
+
+        const aPosLife = gl.getAttribLocation(lifeProgram, 'a_pos');
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+        gl.enableVertexAttribArray(aPosLife);
+        gl.vertexAttribPointer(aPosLife, 2, gl.FLOAT, false, 0, 0);
+
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, currentTex);
+        gl.uniform1i(gl.getUniformLocation(lifeProgram, 'u_state'), 0);
+        gl.uniform2f(gl.getUniformLocation(lifeProgram, 'u_resolution'), SIM_WIDTH, SIM_HEIGHT);
+
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        if (currentTex === texA) {
+            currentTex = texB;
+            currentFB = fbA;
+        } else {
+            currentTex = texA;
+            currentFB = fbB;
+        }
+    }
+
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.useProgram(crtProgram);
+
+    const aPosCRT = gl.getAttribLocation(crtProgram, 'a_pos');
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.enableVertexAttribArray(aPosCRT);
+    gl.vertexAttribPointer(aPosCRT, 2, gl.FLOAT, false, 0, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, currentTex);
+    gl.uniform1i(gl.getUniformLocation(crtProgram, 'u_state'), 0);
+    gl.uniform1f(gl.getUniformLocation(crtProgram, 'u_time'), time * 0.001);
+    gl.uniform2f(gl.getUniformLocation(crtProgram, 'u_resolution'), canvas.width, canvas.height);
+
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    requestAnimationFrame(render);
+}
+
+requestAnimationFrame(render);
+
+canvas.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = Math.floor((e.clientX / rect.width) * SIM_WIDTH);
+    const y = Math.floor((1.0 - e.clientY / rect.height) * SIM_HEIGHT);
+
+    const data = new Uint8Array(SIM_WIDTH * SIM_HEIGHT * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, currentFB === fbA ? fbB : fbA);
+    gl.readPixels(0, 0, SIM_WIDTH, SIM_HEIGHT, gl.RGBA, gl.UNSIGNED_BYTE, data);
+
+    for (let dy = -5; dy <= 5; dy++) {
+        for (let dx = -5; dx <= 5; dx++) {
+            const px = (x + dx + SIM_WIDTH) % SIM_WIDTH;
+            const py = (y + dy + SIM_HEIGHT) % SIM_HEIGHT;
+            const i = (py * SIM_WIDTH + px) * 4;
+            if (Math.random() < 0.5) {
+                data[i] = data[i + 1] = data[i + 2] = 255;
+            }
+        }
+    }
+
+    gl.bindTexture(gl.TEXTURE_2D, currentTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, SIM_WIDTH, SIM_HEIGHT, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+});
+</script>
+</body>
+</html>
